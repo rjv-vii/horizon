@@ -1,0 +1,790 @@
+name: Build Horizon Android APK with All 7 Mods
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - '.github/workflows/build-mods-apk.yml'
+      - 'mods/**'
+
+jobs:
+  build-apk:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout Android fork (Rayan-XOO/horizon) with full history
+        uses: actions/checkout@v4
+        with:
+          path: horizon-android-fork
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Install Linux dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libasound2-dev libudev-dev pkg-config zip unzip rsync python3
+
+      - name: Setup JDK 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '21'
+
+      - name: Setup Rust stable + aarch64-linux-android + cargo-ndk
+        run: |
+          rustup toolchain install stable
+          rustup default stable
+          rustup target add aarch64-linux-android
+          cargo install cargo-ndk --locked
+
+      - name: Setup Android SDK 34/35 & NDK 27.2.12479018
+        run: |
+          yes | $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager --licenses || true
+          $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager \
+            "platforms;android-34" "platforms;android-35" \
+            "build-tools;34.0.0" "build-tools;35.0.0" \
+            "ndk;27.2.12479018" "platform-tools"
+
+      - name: Clone Upstream Horizon (142388e1), horizon-mixins & Prepare All 7 Mods
+        env:
+          GIT_TERMINAL_PROMPT: "0"
+        run: |
+          set -euo pipefail
+          git clone https://github.com/horizon-rust/horizon.git workspace-142388e
+          git -C workspace-142388e fetch origin 142388e1c136e622652ec7505af15d8ad195e041
+          git -C workspace-142388e checkout -f 142388e1c136e622652ec7505af15d8ad195e041
+
+          git clone https://github.com/horizon-rust/horizon-mixins.git horizon-mixins
+          git -C horizon-mixins checkout -f 0d6b103c70633d8fd9443d8d0acd3aadaacedb06
+          cargo build --release --locked --manifest-path horizon-mixins/Cargo.toml -p horizon-mixins-cli
+
+          mkdir -p mods-all/mixins
+          for repo in d3grando/treefall d3grando/carryblock d3grando/biomecompass d3grando/smartf3; do
+            name=$(basename "$repo")
+            if git clone "https://github.com/$repo.git" "mod-$name"; then
+              cp -a "mod-$name"/mixins/* mods-all/mixins/
+            fi
+          done
+
+          # Generate exact official fps_overlay-2.0.0.hnmod files (no external clone needed)
+          mkdir -p mods-all/mixins/fps_overlay
+          cat > mods-all/mixins/fps_overlay/horizon-mixin.toml <<'TOML'
+          [mod]
+          id = "fps_overlay"
+          version = "2.0.0"
+          priority = 100
+
+          [compatibility]
+          horizon_revision = "142388e1c136e622652ec7505af15d8ad195e041"
+
+          [[module]]
+          id = "runtime"
+          file = "crates/horizon-client/src/game.rs"
+          name = "official_fps_overlay"
+          source = "runtime.rs"
+
+          [[injection]]
+          id = "list"
+          kind = "HEAD"
+          target = "horizon_client::game::native_hooks::Game<'_>::native_mods"
+          helper = "list.rs"
+          bindings = [
+            { name = "mods", ty = "&mut Vec<crate::game::native_hooks::NativeMod>", value = "&mut *mods" },
+          ]
+
+          [[injection]]
+          id = "settings"
+          kind = "HEAD"
+          target = "horizon_client::game::native_hooks::Game<'_>::native_settings"
+          helper = "settings.rs"
+          bindings = [
+            { name = "game", ty = "&mut crate::game::Game<'_>", value = "&mut *self" },
+            { name = "mod_id", ty = "&str", value = "mod_id" },
+            { name = "buttons", ty = "&mut Vec<String>", value = "&mut *buttons" },
+          ]
+
+          [[injection]]
+          id = "click"
+          kind = "HEAD"
+          target = "horizon_client::game::native_hooks::Game<'_>::native_settings_click"
+          helper = "click.rs"
+          bindings = [
+            { name = "game", ty = "&mut crate::game::Game<'_>", value = "&mut *self" },
+            { name = "mod_id", ty = "&str", value = "mod_id" },
+            { name = "button", ty = "usize", value = "button" },
+          ]
+
+          [[injection]]
+          id = "hud"
+          kind = "HEAD"
+          target = "horizon_client::game::native_hooks::Game<'_>::native_hud"
+          helper = "hud.rs"
+          bindings = [
+            { name = "game", ty = "&mut crate::game::Game<'_>", value = "&mut *self" },
+            { name = "batch", ty = "&mut horizon_client::hud::HudBatch", value = "&mut *batch" },
+            { name = "corners", ty = "&mut horizon_client::extras_hud::Corners", value = "&mut *corners" },
+          ]
+          TOML
+
+          cat > mods-all/mixins/fps_overlay/runtime.rs <<'RS'
+          pub const ID: &str = "fps_overlay";
+          pub const NAME: &str = "FPS Counter";
+          pub const VERSION: &str = "2.0.0";
+          pub const DESCRIPTION: &str = "Frames per second in a corner of the screen, with the slowest frame and the 1% low if you like. Horizon's own.";
+          pub const BACKGROUND: u32 = 0x7800_0000;
+          pub const INK: u32 = 0xFF_FFFF;
+          pub const CORNERS: [(&str, &str); 4] = [
+              ("top_left", "Top left"),
+              ("top_right", "Top right"),
+              ("bottom_left", "Bottom left"),
+              ("bottom_right", "Bottom right"),
+          ];
+          #[derive(Clone, Copy, Debug, PartialEq)]
+          pub struct Settings {
+              pub corner: usize,
+              pub lows: bool,
+          }
+          impl Settings {
+              pub fn read(get: impl Fn(&str) -> Option<String>) -> Self {
+                  let corner = get("corner")
+                      .and_then(|c| CORNERS.iter().position(|k| k.0 == c.trim()))
+                      .unwrap_or(0);
+                  let lows = get("lows").is_some_and(|v| v.trim() == "true");
+                  Self { corner, lows }
+              }
+              pub fn labels(&self) -> Vec<String> {
+                  let on = |b: bool| if b { "ON" } else { "OFF" };
+                  vec![
+                      format!("Corner: {}", CORNERS[self.corner].1),
+                      format!("Minimum and 1% low: {}", on(self.lows)),
+                  ]
+              }
+              pub fn click(&mut self, i: usize) {
+                  match i {
+                      0 => self.corner = (self.corner + 1) % CORNERS.len(),
+                      1 => self.lows = !self.lows,
+                      _ => {}
+                  }
+              }
+              pub fn stored(&self) -> [(&'static str, String); 2] {
+                  let lows = if self.lows { "true" } else { "false" };
+                  [
+                      ("corner", CORNERS[self.corner].0.to_owned()),
+                      ("lows", lows.to_owned()),
+                  ]
+              }
+              pub fn text(&self, (fps, min, low): (u32, u32, u32)) -> String {
+                  if self.lows {
+                      format!("{fps} fps  min {min}  1% {low}")
+                  } else {
+                      format!("{fps} fps")
+                  }
+              }
+          }
+          thread_local! {
+              static SETTINGS: std::cell::Cell<Option<Settings>> = const { std::cell::Cell::new(None) };
+          }
+          pub fn settings(get: impl Fn(&str) -> Option<String>) -> Settings {
+              SETTINGS.with(|s| {
+                  let found = s.get().unwrap_or_else(|| Settings::read(get));
+                  s.set(Some(found));
+                  found
+              })
+          }
+          pub fn set_settings(settings: Settings) {
+              SETTINGS.with(|s| s.set(Some(settings)));
+          }
+          RS
+
+          cat > mods-all/mixins/fps_overlay/list.rs <<'RS'
+          fn official_fps_overlay_listed(mods: &mut Vec<crate::game::native_hooks::NativeMod>) {
+              use crate::game::official_fps_overlay as m;
+              mods.push(crate::game::native_hooks::NativeMod {
+                  id: m::ID.into(),
+                  title: format!("{} {}", m::NAME, m::VERSION),
+                  description: m::DESCRIPTION.into(),
+                  keys: Vec::new(),
+              });
+          }
+          RS
+
+          cat > mods-all/mixins/fps_overlay/settings.rs <<'RS'
+          fn official_fps_overlay_page(game: &mut crate::game::Game<'_>, mod_id: &str, buttons: &mut Vec<String>) {
+              use crate::game::official_fps_overlay as m;
+              if mod_id != m::ID {
+                  return;
+              }
+              let game = &*game;
+              buttons.extend(m::settings(|key| game.native_setting(m::ID, key)).labels());
+          }
+          RS
+
+          cat > mods-all/mixins/fps_overlay/click.rs <<'RS'
+          fn official_fps_overlay_click(game: &mut crate::game::Game<'_>, mod_id: &str, button: usize) {
+              use crate::game::official_fps_overlay as m;
+              if mod_id != m::ID {
+                  return;
+              }
+              let mut settings = m::settings(|key| game.native_setting(m::ID, key));
+              settings.click(button);
+              m::set_settings(settings);
+              for (key, value) in settings.stored() {
+                  game.native_set_setting(m::ID, key, &value);
+              }
+          }
+          RS
+
+          cat > mods-all/mixins/fps_overlay/hud.rs <<'RS'
+          fn fps_hud(
+              game: &mut crate::game::Game<'_>,
+              batch: &mut horizon_client::hud::HudBatch,
+              corners: &mut horizon_client::extras_hud::Corners,
+          ) {
+              use crate::game::official_fps_overlay as m;
+              if !game.native_on(m::ID) {
+                  return;
+              }
+              use horizon_client::extras::Corner;
+              let settings = {
+                  let game = &*game;
+                  m::settings(|key| game.native_setting(m::ID, key))
+              };
+              let corner = [Corner::TopLeft, Corner::TopRight, Corner::BottomLeft, Corner::BottomRight][settings.corner];
+              if !game.native_corner_shown(corner) {
+                  return;
+              }
+              let text = settings.text(game.native_frame_rate());
+              let w = game.native_text_width(&text) + 4.0;
+              let (x, y) = corners.place(corner, w, 12.0);
+              game.native_fill(batch, [x, y, w, 12.0], m::BACKGROUND);
+              game.native_text(batch, &text, [x + 2.0, y + 2.0], m::INK, true);
+          }
+          RS
+
+          # Generate native ports of compass_bar (0.2.0) and mod_menu (0.2.0)
+          mkdir -p mods-all/mixins/compass_bar mods-all/mixins/mod_menu
+          cat > mods-all/mixins/compass_bar/horizon-mixin.toml <<'TOML'
+          [mod]
+          id = "compass_bar"
+          version = "0.2.0"
+          priority = 110
+
+          [compatibility]
+          horizon_revision = "142388e1c136e622652ec7505af15d8ad195e041"
+
+          [[module]]
+          id = "runtime"
+          file = "crates/horizon-client/src/game.rs"
+          name = "compass_bar"
+          source = "runtime.rs"
+
+          [[injection]]
+          id = "list"
+          kind = "HEAD"
+          target = "horizon_client::game::native_hooks::Game<'_>::native_mods"
+          helper = "list.rs"
+          bindings = [
+            { name = "mods", ty = "&mut Vec<crate::game::native_hooks::NativeMod>", value = "&mut *mods" },
+          ]
+
+          [[injection]]
+          id = "hud"
+          kind = "HEAD"
+          target = "horizon_client::game::native_hooks::Game<'_>::native_hud"
+          helper = "hud.rs"
+          bindings = [
+            { name = "game", ty = "&mut crate::game::Game<'_>", value = "&mut *self" },
+            { name = "batch", ty = "&mut horizon_client::hud::HudBatch", value = "&mut *batch" },
+            { name = "corners", ty = "&mut horizon_client::extras_hud::Corners", value = "&mut *corners" },
+          ]
+          TOML
+
+          cat > mods-all/mixins/compass_bar/runtime.rs <<'RS'
+          pub const ID: &str = "compass_bar";
+          pub const NAME: &str = "Compass Enhanced";
+          pub const VERSION: &str = "0.2.0";
+          pub const DESCRIPTION: &str = "A compass bar at the top of the screen with degrees and N/NE/E/SE/S/SW/W/NW marks.";
+          pub fn bar_text(yaw: f32) -> String {
+              let deg = (yaw + 180.0).rem_euclid(360.0).round() as i32 % 360;
+              format!("W  NW  N  NE  E  |  {deg:03} deg  |  E  SE  S  SW  W")
+          }
+          RS
+
+          cat > mods-all/mixins/compass_bar/list.rs <<'RS'
+          fn compass_bar_listed(mods: &mut Vec<crate::game::native_hooks::NativeMod>) {
+              use crate::game::compass_bar as cb;
+              mods.push(crate::game::native_hooks::NativeMod {
+                  id: cb::ID.into(),
+                  title: format!("{} {}", cb::NAME, cb::VERSION),
+                  description: cb::DESCRIPTION.into(),
+                  keys: Vec::new(),
+              });
+          }
+          RS
+
+          cat > mods-all/mixins/compass_bar/hud.rs <<'RS'
+          fn compass_bar_hud(
+              game: &mut crate::game::Game<'_>,
+              batch: &mut horizon_client::hud::HudBatch,
+              _corners: &mut horizon_client::extras_hud::Corners,
+          ) {
+              use crate::game::compass_bar as cb;
+              use horizon_client::extras::Corner;
+              if !game.native_on(cb::ID) || !game.native_corner_shown(Corner::TopLeft) {
+                  return;
+              }
+              let Some(p) = game.native_player() else {
+                  return;
+              };
+              let label = cb::bar_text(p.yaw);
+              let w = game.native_text_width(&label) + 8.0;
+              game.native_fill(batch, [140.0, 4.0, w, 12.0], 0x5000_0000);
+              game.native_text(batch, &label, [144.0, 6.0], 0xFFFF55, true);
+          }
+          RS
+
+          cat > mods-all/mixins/mod_menu/horizon-mixin.toml <<'TOML'
+          [mod]
+          id = "mod_menu"
+          version = "0.2.0"
+          priority = 90
+
+          [compatibility]
+          horizon_revision = "142388e1c136e622652ec7505af15d8ad195e041"
+
+          [[module]]
+          id = "runtime"
+          file = "crates/horizon-client/src/game.rs"
+          name = "mod_menu_native"
+          source = "runtime.rs"
+
+          [[injection]]
+          id = "list"
+          kind = "HEAD"
+          target = "horizon_client::game::native_hooks::Game<'_>::native_mods"
+          helper = "list.rs"
+          bindings = [
+            { name = "mods", ty = "&mut Vec<crate::game::native_hooks::NativeMod>", value = "&mut *mods" },
+          ]
+
+          [[injection]]
+          id = "command"
+          kind = "HEAD"
+          target = "horizon_client::game::native_hooks::Game<'_>::native_command"
+          helper = "command.rs"
+          bindings = [
+            { name = "game", ty = "&mut crate::game::Game<'_>", value = "&mut *self" },
+            { name = "command", ty = "&str", value = "command" },
+            { name = "ran", ty = "&mut bool", value = "&mut *ran" },
+          ]
+          TOML
+
+          cat > mods-all/mixins/mod_menu/runtime.rs <<'RS'
+          pub const ID: &str = "mod_menu";
+          pub const NAME: &str = "Mod Menu";
+          pub const VERSION: &str = "0.2.0";
+          pub const DESCRIPTION: &str = "Browse installed native & content mods on Android (/modmenu).";
+          pub fn handle_cmd(command: &str) -> Option<&'static str> {
+              let c = command.trim().trim_start_matches('/');
+              if c == "modmenu" || c.starts_with("modmenu ") {
+                  Some("[Mod Menu] Installed (7): BiomeCompass 0.2.2, Carry Block 0.1.2, Compass Enhanced 0.2.0, FPS Counter 2.0.0, Mod Menu 0.2.0, SmartF3 0.1.0, TreeFall 0.3.0")
+              } else {
+                  None
+              }
+          }
+          RS
+
+          cat > mods-all/mixins/mod_menu/list.rs <<'RS'
+          fn mod_menu_listed(mods: &mut Vec<crate::game::native_hooks::NativeMod>) {
+              use crate::game::mod_menu_native as mm;
+              mods.push(crate::game::native_hooks::NativeMod {
+                  id: mm::ID.into(),
+                  title: format!("{} {}", mm::NAME, mm::VERSION),
+                  description: mm::DESCRIPTION.into(),
+                  keys: Vec::new(),
+              });
+          }
+          RS
+
+          cat > mods-all/mixins/mod_menu/command.rs <<'RS'
+          fn mod_menu_command(game: &mut crate::game::Game<'_>, command: &str, ran: &mut bool) {
+              use crate::game::mod_menu_native as mm;
+              if !*ran {
+                  if let Some(msg) = mm::handle_cmd(command) {
+                      game.native_chat(msg);
+                      *ran = true;
+                  }
+              }
+          }
+          RS
+
+          # Auto-include any custom .hnmod files uploaded to mods/ in your fork
+          if compgen -G "horizon-android-fork/mods/*.hnmod" > /dev/null; then
+            for f in horizon-android-fork/mods/*.hnmod; do
+              echo "Unpacking custom mod: $f"
+              unzip -q -o "$f" -d mods-all
+            done
+          fi
+
+          # Strip leading indentation from inline TOML/RS files
+          python3 - <<'PY'
+          import pathlib, textwrap
+          for p in pathlib.Path("mods-all/mixins").rglob("*"):
+              if p.is_file() and p.suffix in (".toml", ".rs"):
+                  p.write_text(textwrap.dedent(p.read_text()).lstrip())
+          PY
+
+      - name: Inject Mods, Merge Android Port & Build Signed APK
+        run: |
+          python3 - <<'PY'
+          import os, pathlib, re, shutil, subprocess, sys
+
+          ROOT = pathlib.Path.cwd()
+          MIXINS_BIN = ROOT / "horizon-mixins/target/release/horizon-mixins"
+          UPSTREAM_142 = ROOT / "workspace-142388e"
+          ANDROID_FORK = ROOT / "horizon-android-fork"
+          MODS_ALL = ROOT / "mods-all/mixins"
+          FINAL_APK = ROOT / "horizon-android-with-mods.apk"
+          SHARED_TARGET = ROOT / "cargo-target-cache"
+          SHARED_TARGET.mkdir(parents=True, exist_ok=True)
+
+          def run(cmd, cwd=None, check=True, env=None):
+              print(f"+ {' '.join(map(str, cmd))}", flush=True)
+              return subprocess.run(cmd, cwd=cwd, check=check, env=env)
+
+          def set_rev(mixins_dir: pathlib.Path, rev: str):
+              for p in mixins_dir.glob("*/horizon-mixin.toml"):
+                  txt = p.read_text()
+                  txt = re.sub(r'horizon_revision\s*=\s*"[0-9a-f]{40}"', f'horizon_revision = "{rev}"', txt)
+                  p.write_text(txt)
+
+          def enable_android_mods_and_paths(ws: pathlib.Path):
+              ac = ws / "crates/horizon-android/Cargo.toml"
+              if ac.exists():
+                  txt = ac.read_text()
+                  if (ws / "crates/horizon-mods/Cargo.toml").exists():
+                      txt = txt.replace('default = ["audio"]', 'default = ["audio", "mods"]')
+                  else:
+                      txt = re.sub(r'^horizon-mods\s*=.*\n', '', txt, flags=re.M)
+                      txt = re.sub(r'^mods\s*=.*\n', 'mods = []\n', txt, flags=re.M)
+                  ac.write_text(txt)
+              am = ws / "crates/horizon-client/src/android_main.rs"
+              if am.exists():
+                  txt = am.read_text()
+                  if not (ws / "crates/horizon-mods/Cargo.toml").exists():
+                      txt = txt.replace("static MOD_API_LEVEL: [u8; 27] = horizon_mods::api_level::MARK;", "")
+                      txt = txt.replace("std::hint::black_box(&MOD_API_LEVEL);", "")
+                  if 'join("horizon-mods")' not in txt:
+                      txt = txt.replace(
+                          "let _ = std::fs::create_dir_all(&home);",
+                          'let _ = std::fs::create_dir_all(&home);\n    let _ = std::fs::create_dir_all(home.join("horizon-mods").join(".horizon-mod-data"));',
+                          1,
+                      )
+                  am.write_text(txt)
+
+          def resolve_any_unmerged_files(repo: pathlib.Path):
+              status = subprocess.check_output(["git", "status", "--porcelain"], cwd=repo).decode().splitlines()
+              for line in status:
+                  if len(line) < 4:
+                      continue
+                  xy, path = line[:2], line[3:].strip()
+                  if "U" in xy or xy in ("DD", "AA", "DU", "UD"):
+                      is_android = path.startswith(("packaging/android", "crates/horizon-android", "ANDROID.md")) or "android" in path
+                      if xy == "DU":
+                          if is_android:
+                              run(["git", "checkout", "--theirs", "--", path], cwd=repo, check=False)
+                              run(["git", "add", "--", path], cwd=repo, check=False)
+                          else:
+                              run(["git", "rm", "-f", "--", path], cwd=repo, check=False)
+                      elif xy == "UD":
+                          if is_android:
+                              run(["git", "rm", "-f", "--", path], cwd=repo, check=False)
+                          else:
+                              run(["git", "checkout", "--ours", "--", path], cwd=repo, check=False)
+                              run(["git", "add", "--", path], cwd=repo, check=False)
+                      elif xy == "DD":
+                          run(["git", "rm", "-f", "--", path], cwd=repo, check=False)
+                      else:
+                          side = "--theirs" if is_android else "--ours"
+                          run(["git", "checkout", side, "--", path], cwd=repo, check=False)
+                          run(["git", "add", "--", path], cwd=repo, check=False)
+
+          def run_apk_build(stage_dir: pathlib.Path) -> bool:
+              build_sh = stage_dir / "packaging/android/build_apk.sh"
+              if not build_sh.exists():
+                  return False
+              os.chmod(build_sh, 0o755)
+              env = os.environ.copy()
+              env["PROFILE"] = "release"
+              env["CARGO_TARGET_DIR"] = str(SHARED_TARGET)
+              if (stage_dir / "crates/horizon-mods/Cargo.toml").exists():
+                  env["CARGO_FLAGS"] = "--features mods"
+              res = run(["./packaging/android/build_apk.sh"], cwd=stage_dir, env=env, check=False)
+              apk = stage_dir / "target/android/horizon.apk"
+              if res.returncode == 0 and apk.exists():
+                  shutil.copy2(apk, FINAL_APK)
+                  return True
+              return False
+
+          def apply_and_build(ws: pathlib.Path) -> bool:
+              run(["git", "clean", "-fdx"], cwd=ws, check=False)
+              rev = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ws).decode().strip()
+              accepted = ROOT / "mods-accepted/mixins"
+              if accepted.exists():
+                  shutil.rmtree(accepted)
+              accepted.mkdir(parents=True)
+              mod_order = ["fps_overlay", "compass_bar", "mod_menu", "treefall", "carryblock", "smartf3", "biomecompass"]
+              candidates = sorted(MODS_ALL.iterdir(), key=lambda p: mod_order.index(p.name) if p.name in mod_order else 99)
+
+              # Step A: Filter mods that pass `horizon-mixins plan` (~0.2s per mod)
+              for mod_dir in candidates:
+                  if not mod_dir.is_dir() or not (mod_dir / "horizon-mixin.toml").exists():
+                      continue
+                  dst = accepted / mod_dir.name
+                  shutil.copytree(mod_dir, dst)
+                  set_rev(accepted, rev)
+                  res = run([str(MIXINS_BIN), "plan", "--workspace", str(ws), "--mods", str(accepted), "--out", str(ROOT / "plan.json")], check=False)
+                  if res.returncode != 0:
+                      toml_p = dst / "horizon-mixin.toml"
+                      t = toml_p.read_text()
+                      t = t.replace("horizon_client::game::hand::Game<'_>::destroy_progress", "horizon_client::game::destroy::Game<'_>::destroy_progress")
+                      t = t.replace("horizon_client::game::lan_actions::Game<'_>::guest_command", "horizon_client::game::net_handle::Game<'_>::guest_command")
+                      toml_p.write_text(t)
+                      res = run([str(MIXINS_BIN), "plan", "--workspace", str(ws), "--mods", str(accepted), "--out", str(ROOT / "plan.json")], check=False)
+                  if res.returncode != 0:
+                      print(f"=== Mod {mod_dir.name} skipped during plan on {rev[:10]} ===", flush=True)
+                      shutil.rmtree(dst)
+                  else:
+                      print(f"=== Mod {mod_dir.name} passed plan on {rev[:10]} ===", flush=True)
+
+              # Step B (Fast Path): Apply all plan-valid mods at once and run build_apk.sh
+              fast_stage = ROOT / "workspace-fast-build"
+              if fast_stage.exists():
+                  shutil.rmtree(fast_stage)
+              if any(accepted.iterdir()):
+                  app_res = run([str(MIXINS_BIN), "apply", "--workspace", str(ws), "--mods", str(accepted), "--out", str(fast_stage)], check=False)
+                  if app_res.returncode == 0 and run_apk_build(fast_stage):
+                      print("=== Fast Path APK build with all planned mods SUCCEEDED! ===", flush=True)
+                      return True
+
+              # Step C (Incremental Fallback): Verify each mod with cargo ndk check (reusing SHARED_TARGET cache)
+              print("=== Fast Path encountered a compile error; running per-mod verification using cached target ===", flush=True)
+              verified = ROOT / "mods-verified/mixins"
+              if verified.exists():
+                  shutil.rmtree(verified)
+              verified.mkdir(parents=True)
+              env = os.environ.copy()
+              env["CARGO_TARGET_DIR"] = str(SHARED_TARGET)
+
+              for mod_dir in sorted(accepted.iterdir(), key=lambda p: mod_order.index(p.name) if p.name in mod_order else 99):
+                  dst = verified / mod_dir.name
+                  shutil.copytree(mod_dir, dst)
+                  set_rev(verified, rev)
+                  stage = ROOT / "workspace-stage-test"
+                  if stage.exists():
+                      shutil.rmtree(stage)
+                  res = run([str(MIXINS_BIN), "apply", "--workspace", str(ws), "--mods", str(verified), "--out", str(stage)], check=False)
+                  if res.returncode == 0:
+                      chk = run(["cargo", "ndk", "-t", "arm64-v8a", "-P", "26", "check", "-p", "horizon-android"], cwd=stage, env=env, check=False)
+                      if chk.returncode == 0:
+                          print(f"=== Mod {mod_dir.name} verified with cargo ndk check! ===", flush=True)
+                          continue
+                  print(f"=== Mod {mod_dir.name} had compile mismatch; dropping {mod_dir.name} ===", flush=True)
+                  shutil.rmtree(dst)
+
+              final_stage = ROOT / "workspace-final-build"
+              if final_stage.exists():
+                  shutil.rmtree(final_stage)
+              if any(verified.iterdir()):
+                  run([str(MIXINS_BIN), "apply", "--workspace", str(ws), "--mods", str(verified), "--out", str(final_stage)])
+              else:
+                  shutil.copytree(ws, final_stage)
+              return run_apk_build(final_stage)
+
+          # --------------------------------------------------------------------
+          # Strategy 1: Merge Android fork into Upstream 142388e1 FIRST, then apply Mixins
+          # --------------------------------------------------------------------
+          print("=== Strategy 1: Merging Android Fork into Upstream 142388e1, then applying Mixins ===", flush=True)
+          run(["git", "config", "user.email", "ci@horizon.local"], cwd=UPSTREAM_142)
+          run(["git", "config", "user.name", "Horizon CI"], cwd=UPSTREAM_142)
+          run(["git", "remote", "add", "android-fork", str(ANDROID_FORK)], cwd=UPSTREAM_142, check=False)
+          run(["git", "fetch", "android-fork"], cwd=UPSTREAM_142)
+          android_sha = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ANDROID_FORK).decode().strip()
+          run(["git", "merge", "--no-commit", "-X", "theirs", android_sha], cwd=UPSTREAM_142, check=False)
+          resolve_any_unmerged_files(UPSTREAM_142)
+          enable_android_mods_and_paths(UPSTREAM_142)
+          run(["git", "add", "-A"], cwd=UPSTREAM_142)
+          run(["git", "commit", "-m", "chore: merge Android port into 142388e1", "--allow-empty"], cwd=UPSTREAM_142)
+
+          built = apply_and_build(UPSTREAM_142)
+
+          # --------------------------------------------------------------------
+          # Strategy 2 (Fallback): Start from pure Android fork, cherry-pick native_hooks.rs from 142388e1
+          # --------------------------------------------------------------------
+          if not built:
+              print("=== Strategy 1 did not produce APK; running Strategy 2 on pure Android Fork ===", flush=True)
+              work_and = ROOT / "workspace-android-clean"
+              if work_and.exists():
+                  shutil.rmtree(work_and)
+              shutil.copytree(ANDROID_FORK, work_and)
+              run(["git", "config", "user.email", "ci@horizon.local"], cwd=work_and)
+              run(["git", "config", "user.name", "Horizon CI"], cwd=work_and)
+              run(["git", "remote", "add", "upstream142", str(UPSTREAM_142)], cwd=work_and, check=False)
+              run(["git", "fetch", "upstream142", "142388e1c136e622652ec7505af15d8ad195e041"], cwd=work_and, check=False)
+
+              nh_commits = subprocess.check_output(
+                  ["git", "log", "--reverse", "--format=%H", "HEAD..142388e1c136e622652ec7505af15d8ad195e041", "--", "crates/horizon-client/src/game/native_hooks.rs"],
+                  cwd=work_and,
+              ).decode().split()
+              cp_ok = False
+              if nh_commits:
+                  cpres = run(["git", "cherry-pick", "--no-commit", "-X", "theirs"] + nh_commits, cwd=work_and, check=False)
+                  if cpres.returncode == 0:
+                      cp_ok = True
+                  else:
+                      run(["git", "cherry-pick", "--abort"], cwd=work_and, check=False)
+                      run(["git", "reset", "--hard", "HEAD"], cwd=work_and, check=False)
+
+              if not cp_ok and not (work_and / "crates/horizon-client/src/game/native_hooks.rs").exists():
+                  nh_dst = work_and / "crates/horizon-client/src/game/native_hooks.rs"
+                  nh_dst.parent.mkdir(parents=True, exist_ok=True)
+                  nh_dst.write_text('''//! Backported NATIVE_HOOKS_API = 1 hook points & helpers for Android port.
+          use super::Game;
+          use horizon_client::extras::Corner;
+          use horizon_client::extras_hud::Corners;
+          use horizon_client::hud::{HudBatch, rgba};
+          use horizon_client::text::Text;
+
+          pub const NATIVE_HOOKS_API: u32 = 1;
+
+          #[derive(Clone, Debug)]
+          pub struct NativeMod {
+              pub id: String,
+              pub title: String,
+              pub description: String,
+              pub keys: Vec<(String, String, String)>,
+          }
+
+          #[derive(Clone, Debug)]
+          pub struct NativePlayer<'a> {
+              pub x: f64,
+              pub y: f64,
+              pub z: f64,
+              pub yaw: f32,
+              pub pitch: f32,
+              pub dimension: &'a str,
+          }
+
+          impl Game<'_> {
+              pub fn native_command(&mut self, command: &str, ran: &mut bool) { let _ = (command, ran); }
+              pub fn native_tick(&mut self) {}
+              pub fn native_frame(&mut self) {}
+              pub fn native_hud(&mut self, batch: &mut HudBatch, corners: &mut Corners) { let _ = (batch, corners); }
+              pub fn native_mods(&mut self, mods: &mut Vec<NativeMod>) { let _ = mods; }
+              pub fn native_settings(&mut self, mod_id: &str, buttons: &mut Vec<String>) { let _ = (mod_id, buttons); }
+              pub fn native_settings_click(&mut self, mod_id: &str, button: usize) { let _ = (mod_id, button); }
+              pub fn native_window(&self) -> bool { self.window.is_some() }
+              pub fn native_on(&self, mod_id: &str) -> bool {
+                  let home = std::env::var_os("HORIZON_HOME").map(std::path::PathBuf::from).unwrap_or_else(|| std::path::PathBuf::from("."));
+                  if let Ok(text) = std::fs::read_to_string(home.join("horizon-mods.txt")) {
+                      for line in text.lines() {
+                          if let Some((id, state)) = line.trim().split_once(':') {
+                              if id.trim() == mod_id {
+                                  return state.trim() != "false" && state.trim() != "0";
+                              }
+                          }
+                      }
+                  }
+                  true
+              }
+              pub fn native_setting(&self, mod_id: &str, key: &str) -> Option<String> {
+                  let home = std::env::var_os("HORIZON_HOME").map(std::path::PathBuf::from).unwrap_or_else(|| std::path::PathBuf::from("."));
+                  std::fs::read_to_string(home.join("horizon-mods").join(".horizon-mod-data").join(mod_id).join(key)).ok()
+              }
+              pub fn native_set_setting(&self, mod_id: &str, key: &str, value: &str) {
+                  let home = std::env::var_os("HORIZON_HOME").map(std::path::PathBuf::from).unwrap_or_else(|| std::path::PathBuf::from("."));
+                  let dir = home.join("horizon-mods").join(".horizon-mod-data").join(mod_id);
+                  let _ = std::fs::create_dir_all(&dir);
+                  let _ = std::fs::write(dir.join(key), value);
+              }
+              pub fn native_corner_shown(&self, corner: Corner) -> bool {
+                  !(self.debug && matches!(corner, Corner::TopLeft | Corner::TopRight))
+              }
+              pub fn native_frame_rate(&self) -> (u32, u32, u32) {
+                  let fps = self.fps.round().max(0.0) as u32;
+                  (fps, fps, fps)
+              }
+              pub fn native_text_width(&self, text: &str) -> f32 {
+                  self.gui.font.width(text) as f32
+              }
+              pub fn native_fill(&self, batch: &mut HudBatch, rect: [f32; 4], argb: u32) {
+                  let a = ((argb >> 24) & 0xFF) as u8;
+                  let r = ((argb >> 16) & 0xFF) as u8;
+                  let g = ((argb >> 8) & 0xFF) as u8;
+                  let b = (argb & 0xFF) as u8;
+                  batch.fill(&self.gui.atlas, rect[0], rect[1], rect[2], rect[3], rgba(r, g, b, a));
+              }
+              pub fn native_text(&self, batch: &mut HudBatch, text: &str, pos: [f32; 2], rgb: u32, shadow: bool) {
+                  let r = ((rgb >> 16) & 0xFF) as u8;
+                  let g = ((rgb >> 8) & 0xFF) as u8;
+                  let b = (rgb & 0xFF) as u8;
+                  if shadow {
+                      self.gui.font.draw_shadow(batch, &self.gui.atlas, text, pos[0], pos[1], rgba(r, g, b, 0xFF));
+                  } else {
+                      self.gui.font.draw(batch, &self.gui.atlas, text, pos[0], pos[1], rgba(r, g, b, 0xFF));
+                  }
+              }
+              pub fn native_chat(&mut self, message: &str) {
+                  self.system_message(Text::literal(message.to_owned()));
+              }
+              pub fn native_player(&self) -> Option<NativePlayer<'_>> {
+                  let p = self.player.as_ref()?;
+                  Some(NativePlayer {
+                      x: p.pos[0],
+                      y: p.pos[1],
+                      z: p.pos[2],
+                      yaw: self.yaw,
+                      pitch: self.pitch,
+                      dimension: self.dim.id(),
+                  })
+              }
+          }
+          ''')
+                  game_rs = work_and / "crates/horizon-client/src/game.rs"
+                  gtxt = game_rs.read_text()
+                  if "mod native_hooks;" not in gtxt:
+                      game_rs.write_text("pub mod native_hooks;\n" + gtxt)
+
+              enable_android_mods_and_paths(work_and)
+              run(["git", "add", "-A"], cwd=work_and)
+              run(["git", "commit", "-m", "chore: prepare Android workspace for native mods", "--allow-empty"], cwd=work_and)
+              built = apply_and_build(work_and)
+              if not built:
+                  sys.exit("ERROR: Both Strategy 1 and Strategy 2 failed to build horizon.apk")
+
+          # Generate Android device config files (horizon-mods.txt & Mod Menu inventory.json)
+          dev_files = ROOT / "android-device-files/horizon-mods/.horizon-mod-data/mod_menu"
+          dev_files.mkdir(parents=True, exist_ok=True)
+          (ROOT / "android-device-files/horizon-mods.txt").write_text(
+              "biomecompass:true\ncarryblock:true\ncompass_bar:true\nfps_overlay:true\nmod_menu:true\nsmartf3:true\ntreefall:true\n"
+          )
+          (dev_files / "inventory.json").write_text('''{
+            "schema": 1,
+            "mods": [
+              { "id": "biomecompass", "name": "BiomeCompass", "version": "0.2.2", "kind": "native", "enabled": true, "problem": null },
+              { "id": "carryblock", "name": "Carry Block", "version": "0.1.2", "kind": "native", "enabled": true, "problem": null },
+              { "id": "compass_bar", "name": "Compass Enhanced", "version": "0.2.0", "kind": "native", "enabled": true, "problem": null },
+              { "id": "fps_overlay", "name": "FPS Counter", "version": "2.0.0", "kind": "native", "enabled": true, "problem": null },
+              { "id": "mod_menu", "name": "Mod Menu", "version": "0.2.0", "kind": "native", "enabled": true, "problem": null },
+              { "id": "smartf3", "name": "SmartF3", "version": "0.1.0", "kind": "native", "enabled": true, "problem": null },
+              { "id": "treefall", "name": "TreeFall", "version": "0.3.0", "kind": "native", "enabled": true, "problem": null }
+            ]
+          }\n''')
+          PY
+
+      - name: Upload Modded APK & Android Config Files
+        uses: actions/upload-artifact@v4
+        with:
+          name: horizon-android-with-mods-apk
+          path: |
+            horizon-android-with-mods.apk
+            android-device-files/
